@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@5
+        uses: actions/checkout@4
 
       - name: Validate inputs and initialize report files
         run: |
