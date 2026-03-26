@@ -24,11 +24,20 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@5
 
       - name: Validate inputs and initialize report files
         run: |
           set -euo pipefail
+
+          mkdir -p reports
+          echo "timestamp_utc,org,username,action,result,http_status,message" > reports/demotions.csv
+          echo "# Demotion Summary" > reports/summary.md
+          echo "" >> reports/summary.md
+          echo "Run timestamp (UTC): $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> reports/summary.md
+          echo "GitHub host: ${GITHUB_HOST}" >> reports/summary.md
+          echo "Org file: ${ORG_FILE}" >> reports/summary.md
+          echo "" >> reports/summary.md
 
           if [ -z "${GH_PAT}" ]; then
             echo "Required secret ORG_ADMIN_PAT is not set."
@@ -40,21 +49,18 @@ jobs:
             exit 1
           fi
 
-          mkdir -p reports
-          echo "timestamp_utc,org,username,action,result,http_status,message" > reports/demotions.csv
-          echo "# Demotion Summary" > reports/summary.md
-          echo "" >> reports/summary.md
-          echo "Run timestamp (UTC): $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> reports/summary.md
-          echo "GitHub host: ${GITHUB_HOST}" >> reports/summary.md
-          echo "Org file: ${ORG_FILE}" >> reports/summary.md
-          echo "" >> reports/summary.md
-
       - name: Validate GitHub token access
+        id: token_check
         run: |
           set -euo pipefail
 
           API_BASE="https://${GITHUB_HOST}/api/v3"
           auth_check_response="$(curl -sS -L -w '\n%{http_code}' \
+            --connect-timeout 15 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: token ${GH_PAT}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -65,19 +71,24 @@ jobs:
 
           if [ "$auth_check_status" != "200" ]; then
             echo "Token validation failed (HTTP ${auth_check_status})."
-            echo "$auth_check_body" | jq -r '.message // "Unable to read error message"'
+            echo "$auth_check_body" | jq -r '.message // "Unable to read error message"' 2>/dev/null || echo "Unable to read error message"
             echo "Ensure ORG_ADMIN_PAT is valid for ${GITHUB_HOST} and has permission to read org members and update memberships."
             exit 1
           fi
 
-          auth_user="$(echo "$auth_check_body" | jq -r '.login // "unknown"')"
+          auth_user="$(echo "$auth_check_body" | jq -r '.login // "unknown"' 2>/dev/null || echo "unknown")"
           echo "Authenticated as: ${auth_user}"
+          echo "auth_user=${auth_user}" >> "$GITHUB_OUTPUT"
 
       - name: Demote owners to members
+        env:
+          AUTH_USER: ${{ steps.token_check.outputs.auth_user }}
         run: |
           set -euo pipefail
 
           API_BASE="https://${GITHUB_HOST}/api/v3"
+          API_HTTP_STATUS=""
+          API_BODY=""
 
           sanitize_csv_field() {
             local value="$1"
@@ -105,6 +116,67 @@ jobs:
               >> reports/demotions.csv
           }
 
+          get_error_message() {
+            local body="$1"
+            local fallback="$2"
+            local message
+            message="$(echo "$body" | jq -r '.message // empty' 2>/dev/null || true)"
+            if [ -z "$message" ] || [ "$message" = "null" ]; then
+              echo "$fallback"
+            else
+              echo "$message"
+            fi
+          }
+
+          call_api() {
+            local method="$1"
+            local url="$2"
+            local payload="${3-}"
+            local body_file
+            local http_status
+            local curl_exit
+
+            body_file="$(mktemp)"
+            set +e
+            if [ -n "$payload" ]; then
+              http_status="$(curl -sS -L -X "$method" -o "$body_file" -w '%{http_code}' \
+                --connect-timeout 15 \
+                --max-time 60 \
+                --retry 3 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: token ${GH_PAT}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url" \
+                -d "$payload")"
+            else
+              http_status="$(curl -sS -L -X "$method" -o "$body_file" -w '%{http_code}' \
+                --connect-timeout 15 \
+                --max-time 60 \
+                --retry 3 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: token ${GH_PAT}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url")"
+            fi
+            curl_exit=$?
+            set -e
+
+            API_BODY="$(cat "$body_file")"
+            rm -f "$body_file"
+
+            if [ "$curl_exit" -ne 0 ]; then
+              API_HTTP_STATUS="000"
+              return 1
+            fi
+
+            API_HTTP_STATUS="$http_status"
+            return 0
+          }
+
           demoted_count=0
           failed_count=0
           org_count=0
@@ -126,17 +198,21 @@ jobs:
 
             while true; do
               list_url="${API_BASE}/orgs/${org}/members?role=admin&per_page=100&page=${page}"
-              list_response="$(curl -sS -L -w '\n%{http_code}' \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GH_PAT}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "$list_url")"
+              if ! call_api "GET" "$list_url"; then
+                message="Network error while listing admins for org ${org}"
+                echo "  ${message}"
+                log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "failed" "000" "$message"
+                echo "  - list admins failed (network error)" >> reports/summary.md
+                failed_count=$((failed_count + 1))
+                org_had_error=1
+                break
+              fi
 
-              list_body="$(echo "$list_response" | sed '$d')"
-              list_status="$(echo "$list_response" | tail -n1)"
+              list_body="$API_BODY"
+              list_status="$API_HTTP_STATUS"
 
               if [ "$list_status" != "200" ]; then
-                message="Failed to list admins for org ${org}"
+                message="$(get_error_message "$list_body" "Failed to list admins for org ${org}")"
                 echo "  ${message} (HTTP ${list_status})"
                 log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "failed" "$list_status" "$message"
                 echo "  - list admins failed (HTTP ${list_status})" >> reports/summary.md
@@ -145,7 +221,17 @@ jobs:
                 break
               fi
 
-              admin_page_count="$(echo "$list_body" | jq 'length')"
+              admin_page_count="$(echo "$list_body" | jq -r 'if type == "array" then length else -1 end' 2>/dev/null || echo "-1")"
+
+              if [ "$admin_page_count" -lt 0 ]; then
+                message="Invalid API response while listing admins for org ${org}"
+                echo "  ${message}"
+                log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "failed" "$list_status" "$message"
+                echo "  - invalid response while listing admins" >> reports/summary.md
+                failed_count=$((failed_count + 1))
+                org_had_error=1
+                break
+              fi
 
               if [ "$admin_page_count" -eq 0 ]; then
                 if [ "$page" -eq 1 ]; then
@@ -166,30 +252,37 @@ jobs:
                   continue
                 fi
 
+                if [ "${username^^}" = "${AUTH_USER^^}" ]; then
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "skipped" "n/a" "Token owner cannot demote self"
+                  echo "  - skipped token owner: ${username}" >> reports/summary.md
+                  continue
+                fi
+
                 demote_url="${API_BASE}/orgs/${org}/memberships/${username}"
                 demote_payload='{"role":"member"}'
 
-                demote_response="$(curl -sS -L -X PUT -w '\n%{http_code}' \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "Authorization: Bearer ${GH_PAT}" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "$demote_url" \
-                  -d "$demote_payload")"
+                if ! call_api "PUT" "$demote_url" "$demote_payload"; then
+                  message="Network error while demoting ${username}"
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "failed" "000" "$message"
+                  echo "  - failed to demote ${username} (network error)" >> reports/summary.md
+                  failed_count=$((failed_count + 1))
+                  continue
+                fi
 
-                demote_body="$(echo "$demote_response" | sed '$d')"
-                demote_status="$(echo "$demote_response" | tail -n1)"
+                demote_body="$API_BODY"
+                demote_status="$API_HTTP_STATUS"
 
                 if [ "$demote_status" = "200" ] || [ "$demote_status" = "201" ]; then
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "success" "$demote_status" "Role changed to member"
                   echo "  - demoted: ${username}" >> reports/summary.md
                   demoted_count=$((demoted_count + 1))
                 else
-                  error_message="$(echo "$demote_body" | jq -r '.message // "Unknown API error"')"
+                  error_message="$(get_error_message "$demote_body" "Unknown API error")"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "failed" "$demote_status" "$error_message"
                   echo "  - failed to demote ${username} (HTTP ${demote_status})" >> reports/summary.md
                   failed_count=$((failed_count + 1))
                 fi
-              done < <(echo "$list_body" | jq -r '.[].login')
+              done < <(echo "$list_body" | jq -r 'if type == "array" then .[].login else empty end' 2>/dev/null)
 
               if [ "$admin_page_count" -lt 100 ]; then
                 break
@@ -211,20 +304,24 @@ jobs:
 
       - name: Upload demotion report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: demotion-report-${{ github.run_id }}
           path: reports/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
   publish-results:
     runs-on: ubuntu-latest
     needs: demote-owners
     if: always()
+    env:
+      DEMOTE_JOB_RESULT: ${{ needs.demote-owners.result }}
     steps:
       - name: Download demotion report artifact
-        uses: actions/download-artifact@v4
+        id: download_report
+        continue-on-error: true
+        uses: actions/download-artifact@v5
         with:
           name: demotion-report-${{ github.run_id }}
           path: reports
@@ -233,12 +330,45 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ ! -f "reports/summary.md" ] || [ ! -f "reports/demotions.csv" ]; then
+            echo "## Demotion Workflow Results" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Report files were not available for publishing." >> "$GITHUB_STEP_SUMMARY"
+            echo "Demote job result: ${DEMOTE_JOB_RESULT}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           echo "## Demotion Workflow Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           cat reports/summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### CSV Report Preview" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Report Table Preview" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```csv' >> "$GITHUB_STEP_SUMMARY"
-          head -n 25 reports/demotions.csv >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import csv
+          import os
+
+          summary_file = os.environ["GITHUB_STEP_SUMMARY"]
+
+          with open("reports/demotions.csv", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+          if not rows:
+            with open(summary_file, "a", encoding="utf-8") as out:
+              out.write("No report rows found.\n")
+          else:
+            headers = rows[0]
+            data_rows = rows[1:]
+
+            def md_escape(value: str) -> str:
+              return value.replace("|", "\\|").replace("\n", " ").strip()
+
+            with open(summary_file, "a", encoding="utf-8") as out:
+              out.write("| " + " | ".join(md_escape(h) for h in headers) + " |\n")
+              out.write("| " + " | ".join("---" for _ in headers) + " |\n")
+              for row in data_rows:
+                # Pad short rows defensively in case of malformed csv lines.
+                padded = row + [""] * (len(headers) - len(row))
+                out.write("| " + " | ".join(md_escape(c) for c in padded[: len(headers)]) + " |\n")
+          PY
