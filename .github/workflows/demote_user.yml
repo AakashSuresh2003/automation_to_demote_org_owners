@@ -136,6 +136,12 @@ jobs:
               while IFS= read -r username; do
                 [ -z "$username" ] && continue
 
+                if [ "${username^^}" = "MGITHUB" ]; then
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "skipped" "n/a" "Protected owner account"
+                  echo "  - skipped protected owner: ${username}" >> reports/summary.md
+                  continue
+                fi
+
                 demote_url="${API_BASE}/orgs/${org}/memberships/${username}"
                 demote_payload='{"role":"member"}'
 
