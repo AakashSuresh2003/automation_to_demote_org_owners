@@ -1,8 +1,5 @@
 name: Demote Org Owners To Members
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 on:
   workflow_dispatch:
     inputs:
@@ -184,6 +181,10 @@ jobs:
           failed_count=0
           org_count=0
 
+          echo "Starting demotion run"
+          echo "Host: ${GITHUB_HOST}"
+          echo "Org file: ${ORG_FILE}"
+
           while IFS= read -r raw_org || [ -n "$raw_org" ]; do
             org="$(echo "$raw_org" | sed -E 's/^\s+|\s+$//g')"
 
@@ -199,8 +200,11 @@ jobs:
             org_had_error=0
             org_admin_count=0
 
+            echo "  Starting org processing: ${org}"
+
             while true; do
               list_url="${API_BASE}/orgs/${org}/members?role=admin&per_page=100&page=${page}"
+              echo "  Fetching admin users page ${page} for ${org}"
               if ! call_api "GET" "$list_url"; then
                 message="Network error while listing admins for org ${org}"
                 echo "  ${message}"
@@ -238,11 +242,14 @@ jobs:
 
               if [ "$admin_page_count" -eq 0 ]; then
                 if [ "$page" -eq 1 ]; then
+                  echo "  No admin users found in ${org}"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "ok" "$list_status" "No admin users found"
                   echo "  - no admin users found" >> reports/summary.md
                 fi
                 break
               fi
+
+              echo "  Found ${admin_page_count} admin user(s) on page ${page}"
 
               org_admin_count=$((org_admin_count + admin_page_count))
 
@@ -250,12 +257,12 @@ jobs:
                 [ -z "$username" ] && continue
 
                 if [ "${username^^}" = "MGITHUB" ]; then
-                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "skipped" "n/a" "Protected owner account"
-                  echo "  - skipped protected owner: ${username}" >> reports/summary.md
+                  echo "  Skipping protected owner: ${username}"
                   continue
                 fi
 
                 if [ "${username^^}" = "${AUTH_USER^^}" ]; then
+                  echo "  Skipping token owner account: ${username}"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "skipped" "n/a" "Token owner cannot demote self"
                   echo "  - skipped token owner: ${username}" >> reports/summary.md
                   continue
@@ -263,9 +270,11 @@ jobs:
 
                 demote_url="${API_BASE}/orgs/${org}/memberships/${username}"
                 demote_payload='{"role":"member"}'
+                echo "  Demoting user: ${username}"
 
                 if ! call_api "PUT" "$demote_url" "$demote_payload"; then
                   message="Network error while demoting ${username}"
+                  echo "  ${message}"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "failed" "000" "$message"
                   echo "  - failed to demote ${username} (network error)" >> reports/summary.md
                   failed_count=$((failed_count + 1))
@@ -276,11 +285,13 @@ jobs:
                 demote_status="$API_HTTP_STATUS"
 
                 if [ "$demote_status" = "200" ] || [ "$demote_status" = "201" ]; then
+                  echo "  Successfully demoted ${username}"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "success" "$demote_status" "Role changed to member"
                   echo "  - demoted: ${username}" >> reports/summary.md
                   demoted_count=$((demoted_count + 1))
                 else
                   error_message="$(get_error_message "$demote_body" "Unknown API error")"
+                  echo "  Failed to demote ${username} (HTTP ${demote_status}): ${error_message}"
                   log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "failed" "$demote_status" "$error_message"
                   echo "  - failed to demote ${username} (HTTP ${demote_status})" >> reports/summary.md
                   failed_count=$((failed_count + 1))
@@ -295,6 +306,7 @@ jobs:
             done
 
             if [ "$org_had_error" -eq 0 ] && [ "$org_admin_count" -gt 0 ]; then
+              echo "Completed ${org}: processed ${org_admin_count} admin user(s)"
               echo "  - processed ${org_admin_count} admin user(s)" >> reports/summary.md
             fi
           done < "${ORG_FILE}"
@@ -304,6 +316,11 @@ jobs:
           echo "- Organizations processed: ${org_count}" >> reports/summary.md
           echo "- Users demoted successfully: ${demoted_count}" >> reports/summary.md
           echo "- Failed operations: ${failed_count}" >> reports/summary.md
+
+          echo "Run complete"
+          echo "Organizations processed: ${org_count}"
+          echo "Users demoted successfully: ${demoted_count}"
+          echo "Failed operations: ${failed_count}"
 
       - name: Upload demotion report artifact
         if: always()
