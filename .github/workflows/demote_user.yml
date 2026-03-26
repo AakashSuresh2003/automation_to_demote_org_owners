@@ -1,0 +1,189 @@
+name: Demote Org Owners To Members
+
+on:
+  workflow_dispatch:
+    inputs:
+      org_file:
+        description: "Path to text file containing org names (one org per line)"
+        required: false
+        default: "input/org.txt"
+      github_host:
+        description: "GitHub Enterprise host (without protocol)"
+        required: false
+        default: "github.ford.com"
+
+jobs:
+  demote-owners:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_PAT: ${{ secrets.ORG_ADMIN_PAT }}
+      GITHUB_HOST: ${{ github.event.inputs.github_host || 'github.ford.com' }}
+      ORG_FILE: ${{ github.event.inputs.org_file || 'input/org.txt' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and initialize report files
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_PAT}" ]; then
+            echo "Required secret ORG_ADMIN_PAT is not set."
+            exit 1
+          fi
+
+          if [ ! -f "${ORG_FILE}" ]; then
+            echo "Org file not found: ${ORG_FILE}"
+            exit 1
+          fi
+
+          mkdir -p reports
+          echo "timestamp_utc,org,username,action,result,http_status,message" > reports/demotions.csv
+          echo "# Demotion Summary" > reports/summary.md
+          echo "" >> reports/summary.md
+          echo "Run timestamp (UTC): $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> reports/summary.md
+          echo "GitHub host: ${GITHUB_HOST}" >> reports/summary.md
+          echo "Org file: ${ORG_FILE}" >> reports/summary.md
+          echo "" >> reports/summary.md
+
+      - name: Demote owners to members
+        run: |
+          set -euo pipefail
+
+          API_BASE="https://${GITHUB_HOST}/api/v3"
+
+          sanitize_csv_field() {
+            local value="$1"
+            value="${value//\"/\"\"}"
+            printf '"%s"' "$value"
+          }
+
+          log_csv() {
+            local timestamp_utc="$1"
+            local org="$2"
+            local username="$3"
+            local action="$4"
+            local result="$5"
+            local http_status="$6"
+            local message="$7"
+
+            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+              "$(sanitize_csv_field "$timestamp_utc")" \
+              "$(sanitize_csv_field "$org")" \
+              "$(sanitize_csv_field "$username")" \
+              "$(sanitize_csv_field "$action")" \
+              "$(sanitize_csv_field "$result")" \
+              "$(sanitize_csv_field "$http_status")" \
+              "$(sanitize_csv_field "$message")" \
+              >> reports/demotions.csv
+          }
+
+          demoted_count=0
+          failed_count=0
+          org_count=0
+
+          while IFS= read -r raw_org || [ -n "$raw_org" ]; do
+            org="$(echo "$raw_org" | sed -E 's/^\s+|\s+$//g')"
+
+            if [ -z "$org" ] || [[ "$org" =~ ^# ]]; then
+              continue
+            fi
+
+            org_count=$((org_count + 1))
+            echo "Processing organization: $org"
+            echo "- ${org}" >> reports/summary.md
+
+            page=1
+            org_had_error=0
+            org_admin_count=0
+
+            while true; do
+              list_url="${API_BASE}/orgs/${org}/members?role=admin&per_page=100&page=${page}"
+              list_response="$(curl -sS -L -w '\n%{http_code}' \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_PAT}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$list_url")"
+
+              list_body="$(echo "$list_response" | sed '$d')"
+              list_status="$(echo "$list_response" | tail -n1)"
+
+              if [ "$list_status" != "200" ]; then
+                message="Failed to list admins for org ${org}"
+                echo "  ${message} (HTTP ${list_status})"
+                log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "failed" "$list_status" "$message"
+                echo "  - list admins failed (HTTP ${list_status})" >> reports/summary.md
+                failed_count=$((failed_count + 1))
+                org_had_error=1
+                break
+              fi
+
+              admin_page_count="$(echo "$list_body" | jq 'length')"
+
+              if [ "$admin_page_count" -eq 0 ]; then
+                if [ "$page" -eq 1 ]; then
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "" "list_admins" "ok" "$list_status" "No admin users found"
+                  echo "  - no admin users found" >> reports/summary.md
+                fi
+                break
+              fi
+
+              org_admin_count=$((org_admin_count + admin_page_count))
+
+              while IFS= read -r username; do
+                [ -z "$username" ] && continue
+
+                demote_url="${API_BASE}/orgs/${org}/memberships/${username}"
+                demote_payload='{"role":"member"}'
+
+                demote_response="$(curl -sS -L -X PUT -w '\n%{http_code}' \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${GH_PAT}" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "$demote_url" \
+                  -d "$demote_payload")"
+
+                demote_body="$(echo "$demote_response" | sed '$d')"
+                demote_status="$(echo "$demote_response" | tail -n1)"
+
+                if [ "$demote_status" = "200" ] || [ "$demote_status" = "201" ]; then
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "success" "$demote_status" "Role changed to member"
+                  echo "  - demoted: ${username}" >> reports/summary.md
+                  demoted_count=$((demoted_count + 1))
+                else
+                  error_message="$(echo "$demote_body" | jq -r '.message // "Unknown API error"')"
+                  log_csv "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$org" "$username" "demote_owner" "failed" "$demote_status" "$error_message"
+                  echo "  - failed to demote ${username} (HTTP ${demote_status})" >> reports/summary.md
+                  failed_count=$((failed_count + 1))
+                fi
+              done < <(echo "$list_body" | jq -r '.[].login')
+
+              if [ "$admin_page_count" -lt 100 ]; then
+                break
+              fi
+
+              page=$((page + 1))
+            done
+
+            if [ "$org_had_error" -eq 0 ] && [ "$org_admin_count" -gt 0 ]; then
+              echo "  - processed ${org_admin_count} admin user(s)" >> reports/summary.md
+            fi
+          done < "${ORG_FILE}"
+
+          echo "" >> reports/summary.md
+          echo "Totals:" >> reports/summary.md
+          echo "- Organizations processed: ${org_count}" >> reports/summary.md
+          echo "- Users demoted successfully: ${demoted_count}" >> reports/summary.md
+          echo "- Failed operations: ${failed_count}" >> reports/summary.md
+
+      - name: Upload demotion report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demotion-report-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30
