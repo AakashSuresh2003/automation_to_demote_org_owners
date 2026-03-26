@@ -1,5 +1,8 @@
 name: Demote Org Owners To Members
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   workflow_dispatch:
     inputs:
@@ -24,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@4
+        uses: actions/checkout@v4
 
       - name: Validate inputs and initialize report files
         run: |
@@ -304,7 +307,7 @@ jobs:
 
       - name: Upload demotion report artifact
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: demotion-report-${{ github.run_id }}
           path: reports/
@@ -321,7 +324,7 @@ jobs:
       - name: Download demotion report artifact
         id: download_report
         continue-on-error: true
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           name: demotion-report-${{ github.run_id }}
           path: reports
